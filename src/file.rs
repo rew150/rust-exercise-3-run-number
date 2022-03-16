@@ -1,19 +1,23 @@
 use std::{
     ffi::{
-        CString, NulError, IntoStringError,
+        CString, NulError, IntoStringError, c_void
     },
     os::raw::{
         c_int, c_char,
     },
     string::{
         FromUtf8Error,
-    }, borrow::Cow,
+    }, borrow::Cow, mem::size_of,
 };
+
+use self::C::wrapped_fpos;
 
 mod C {
     use std::marker::{PhantomData,PhantomPinned};
     use std::os::raw::c_char;
     use std::os::raw::c_int;
+
+    use libc::{c_void, size_t};
 
     // opaque struct FILE
     #[repr(C)]
@@ -30,10 +34,15 @@ mod C {
 
     extern {
         pub fn fopen(filename: *const c_char, mode: *const c_char) -> *mut FILE;
-        pub fn fputs(str: *const c_char, stream: *mut FILE) -> c_int;
         pub fn fclose(stream: *mut FILE) -> c_int;
+        pub fn fputs(str: *const c_char, stream: *mut FILE) -> c_int;
         pub fn fgets(string: *mut c_char, num: c_int, stream: *mut FILE) -> *mut c_char;
+        pub fn fwrite(buffer: *const c_void, size: size_t, count: size_t, stream: *mut FILE) -> size_t;
+        pub fn fread(buffer: *mut c_void, size: size_t, count: size_t, stream: *mut FILE) -> size_t;
+        pub fn fgetc(stream: *mut FILE) -> c_int;
+        pub fn fflush(stream: *mut FILE) -> c_int;
         pub fn fgetpos(stream: *mut FILE, pos: *mut fpos_t) -> c_int;
+        pub fn fsetpos(stream: *mut FILE, pos: *const fpos_t) -> c_int;
         pub fn feof(stream: *mut FILE) -> c_int;
         pub fn ferror(stream: *mut FILE) -> c_int;
         pub fn clearerr(stream: *mut FILE);
@@ -41,29 +50,48 @@ mod C {
         // non std lib
         pub fn allocate_fpos_t() -> *mut fpos_t;
         pub fn deallocate_fpos_t(ptr: *mut fpos_t);
+        pub fn copy_fpos_t(dst: *mut fpos_t, src: *const fpos_t);
     }
 
-    pub struct fpos_heap {
+    pub struct wrapped_fpos {
         ptr: *mut fpos_t,
         _marker: PhantomData<fpos_t>,
     }
 
-    impl fpos_heap {
+    impl wrapped_fpos {
         pub fn new() -> Self {
             unsafe {
-                fpos_heap {
+                wrapped_fpos {
                     ptr: allocate_fpos_t(),
                     _marker: PhantomData
                 }
             }
         }
 
-        pub fn as_ptr(&mut self) -> *mut fpos_t {
+        pub fn clone_from_ptr(src: *mut fpos_t) -> Self {
+            let res = wrapped_fpos::new();
+            unsafe {
+                copy_fpos_t(res.ptr, src);
+            }
+            res
+        }
+
+        pub fn as_mut_ptr(&mut self) -> *mut fpos_t {
+            self.ptr
+        }
+
+        pub fn as_ptr(&self) -> *const fpos_t {
             self.ptr
         }
     }
 
-    impl Drop for fpos_heap {
+    impl Clone for wrapped_fpos {
+        fn clone(&self) -> wrapped_fpos {
+            wrapped_fpos::clone_from_ptr(self.ptr)
+        }
+    }
+
+    impl Drop for wrapped_fpos {
         fn drop(&mut self) {
             unsafe {
                 deallocate_fpos_t(self.ptr);
@@ -73,7 +101,7 @@ mod C {
 }
 
 #[derive(thiserror::Error, Debug)]
-pub enum Error<'a> {
+pub enum Error {
     // CString error
     #[error(transparent)]
     CStringNul(#[from] NulError),
@@ -86,12 +114,16 @@ pub enum Error<'a> {
     #[error("cannot fopen")]
     FileOpen,
     #[error("cannot write to file: {0}")]
-    FileWrite(Cow<'a, str>),
+    FileWrite(String),
     #[error("cannot read from file: {0}")]
-    FileRead(Cow<'a, str>),
+    FileRead(String),
+    #[error("cannot get pos: {0}")]
+    FileGetPos(String),
+    #[error("cannot set pos: {0}")]
+    FileSetPos(String),
 }
 
-pub type Result<'a, T> = std::result::Result<T, Error<'a>>;
+pub type Result<T> = std::result::Result<T, Error>;
 
 pub struct CFileHandler {
     _fhandler: *mut C::FILE,
@@ -99,6 +131,18 @@ pub struct CFileHandler {
 }
 
 impl CFileHandler {
+    pub fn err_ind(&self) -> bool {
+        unsafe {
+            C::ferror(self._fhandler) != 0
+        }
+    }
+
+    pub fn eof_ind(&self) -> bool {
+        unsafe {
+            C::feof(self._fhandler) != 0
+        }
+    }
+
     pub fn puts(&mut self, string: &str) -> Result<()> {
         let string = CString::new(string)?;
         let string = string.as_ptr();
@@ -126,10 +170,8 @@ impl CFileHandler {
 
             let err = C::ferror(self._fhandler);
             if err != 0 {
-                return Err(Error::FileRead(format!("gets {}", err).into()))
+                return Err(Error::FileRead(format!("gets {}", err)))
             }
-
-            let reached_eof = C::feof(self._fhandler) != 0;
 
             let len = buff
                 .iter()
@@ -138,8 +180,60 @@ impl CFileHandler {
             buff.truncate(len);
 
             String::from_utf8(buff)
-                .map(|s| (s, reached_eof))
+                .map(|s| (s, self.eof_ind()))
                 .map_err(|e| e.into())
+        }
+    }
+
+    pub fn write_flush<T>(&mut self, data: &[T]) -> usize {
+        unsafe {
+            let written = C::fwrite(data.as_ptr() as *const c_void, size_of::<T>(), data.len(), self._fhandler);
+            C::fflush(self._fhandler);
+            written
+        }
+    }
+
+    pub fn read_until_char(&self, start_pos: C::wrapped_fpos, until: u8) -> Result<(String, bool)> {
+        let mut res = vec![];
+        unsafe {
+            // clear error, eof flags
+            C::clearerr(self._fhandler);
+
+            let setposres = C::fsetpos(self._fhandler, start_pos.as_ptr());
+            if setposres != 0 {
+                return Err(Error::FileSetPos(format!("{}", setposres)))
+            }
+
+            let mut c;
+            while {
+                c = C::fgetc(self._fhandler) as u8;
+                !self.err_ind() && !self.eof_ind()
+            } {
+                res.push(c);
+                if c == until {
+                    break;
+                }
+            }
+
+            let err = C::ferror(self._fhandler);
+            if err != 0 {
+                return Err(Error::FileRead(format!("{}", err)));
+            }
+        }
+        String::from_utf8(res)
+            .map(|s| (s, self.eof_ind()))
+            .map_err(|e| e.into())
+    }
+
+    pub fn current_pos(&self) -> Result<wrapped_fpos> {
+        unsafe {
+            let mut pos = wrapped_fpos::new();
+            let err = C::fgetpos(self._fhandler, pos.as_mut_ptr());
+            if err == 0 {
+                Ok(pos)
+            } else {
+                Err(Error::FileGetPos(format!("{}", err)))
+            }
         }
     }
 }
@@ -152,7 +246,7 @@ impl Drop for CFileHandler {
     }
 }
 
-pub fn open_file<'a, 'b, 'c>(filename: &'a str, mode: &'b str) -> Result<'c, CFileHandler> {
+pub fn open_file<'a, 'b>(filename: &'a str, mode: &'b str) -> Result<CFileHandler> {
     let filename = CString::new(filename)?;
     let filename = filename.as_ptr();
     let mode = CString::new(mode)?;
